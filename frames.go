@@ -14,6 +14,15 @@ type (
 	Decoder struct {
 		src io.Reader
 		err error
+
+		// frames counts the frames decoded so far; it is the
+		// index reported in validation errors.
+		frames int
+		// reservoir and reservoirValid track the number of main
+		// data bytes the preceding frames may have contributed to
+		// the bit reservoir.
+		reservoir      int
+		reservoirValid bool
 	}
 
 	// Frame represents one individual mp3 frame
@@ -166,7 +175,7 @@ func init() {
 
 // NewDecoder returns a decoder that will process the provided reader.
 func NewDecoder(r io.Reader) *Decoder {
-	return &Decoder{r, nil}
+	return &Decoder{src: r}
 }
 
 // fill slice d until it is of len l, using bytes from reader r
@@ -253,6 +262,16 @@ func (d *Decoder) Decode(v *Frame, skipped *int) (err error) {
 	if err != nil {
 		return err
 	}
+
+	// Skipped bytes mean we lost sync; the bit reservoir accounting
+	// from before the gap can no longer be trusted.
+	if *skipped > 0 {
+		d.reservoirValid = false
+	}
+	if err := d.validate(v); err != nil {
+		return err
+	}
+	d.frames++
 
 	return nil
 }
@@ -410,7 +429,7 @@ func (h FrameHeader) String() string {
 // 0 indicates that the data begins after the side channel information. This data is the
 // data from the "bit reservoir" and can be up to 511 bytes
 func (i FrameSideInfo) NDataBegin() uint16 {
-	return (uint16(i[0]) << 1 & (uint16(i[1]) >> 7))
+	return (uint16(i[0]) << 1) | (uint16(i[1]) >> 7)
 }
 
 // Samples determines the number of samples based on the MPEG version and Layer from the header
