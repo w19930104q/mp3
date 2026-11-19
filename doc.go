@@ -23,6 +23,13 @@
 // is primarily intended for streaming tasks with minimal internal buffering
 // and no requirement to seek.
 //
+// Frame buffers are recycled by capacity class through a BufferPool whose
+// retained memory is capped (see DefaultFrameBufferLimit and
+// NewDecoderWithBufferLimit), so peak memory while decoding frame by frame
+// stays bounded regardless of the stream's duration. Decoding into a fresh
+// Frame each iteration should be paired with Frame.Release to return the
+// buffer to the pool.
+//
 // The implementation started as a reworking of github.com/badgerodon/mp3, and
 // has also drawn from Konrad Windszus' excellent article on mp3 frame parsing
 // http://www.codeproject.com/Articles/8295/MPEG-Audio-Frame-Header

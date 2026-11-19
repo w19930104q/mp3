@@ -12,13 +12,21 @@ import (
 type (
 	// Decoder translates a io.Reader into a series of frames
 	Decoder struct {
-		src io.Reader
-		err error
+		src  io.Reader
+		err  error
+		pool *BufferPool
 	}
 
 	// Frame represents one individual mp3 frame
 	Frame struct {
 		buf []byte
+
+		// pool and pbuf track the pooled backing buffer for buf, so it
+		// can be recycled by capacity class on Release or when Decode
+		// replaces it. pbuf is the whole buffer as obtained from pool;
+		// buf may be a sub-slice of it.
+		pool *BufferPool
+		pbuf []byte
 	}
 
 	// FrameHeader represents the entire header of a frame
@@ -164,9 +172,34 @@ func init() {
 	samplesPerFrame[MPEG25] = samplesPerFrame[MPEG2]
 }
 
+// defaultBufferPool is shared by all decoders created with NewDecoder.
+// Its retained memory is bounded by DefaultFrameBufferLimit regardless
+// of how many frames are decoded.
+var defaultBufferPool = NewBufferPool(DefaultFrameBufferLimit)
+
 // NewDecoder returns a decoder that will process the provided reader.
+// Frame buffers are drawn from a shared pool whose retained memory is
+// capped at DefaultFrameBufferLimit; see NewDecoderWithBufferLimit to
+// choose a different cap.
 func NewDecoder(r io.Reader) *Decoder {
-	return &Decoder{r, nil}
+	return &Decoder{src: r, pool: defaultBufferPool}
+}
+
+// NewDecoderWithBufferLimit returns a decoder that will process the
+// provided reader, recycling frame buffers through a private pool that
+// retains at most limit bytes of idle buffers. Peak memory while
+// decoding frame by frame is bounded by the largest frame plus limit,
+// independent of the stream's duration.
+func NewDecoderWithBufferLimit(r io.Reader, limit int64) *Decoder {
+	return &Decoder{src: r, pool: NewBufferPool(limit)}
+}
+
+// NewDecoderWithBufferPool returns a decoder that will process the
+// provided reader, recycling frame buffers through the supplied pool.
+// This allows several decoders to share one memory budget. A nil pool
+// disables buffer recycling entirely.
+func NewDecoderWithBufferPool(r io.Reader, p *BufferPool) *Decoder {
+	return &Decoder{src: r, pool: p}
 }
 
 // fill slice d until it is of len l, using bytes from reader r
@@ -197,8 +230,37 @@ func fillbuf(d []byte, r io.Reader, l int) (res []byte, err error) {
 	return d, err
 }
 
+// framebuf ensures v.buf holds at least l bytes, reading any missing
+// bytes from the decoder's source. When the frame's current buffer is
+// too small, a replacement is obtained from the decoder's buffer pool
+// (reusing a retained buffer of the appropriate capacity class when one
+// is available) and the frame's previous pooled buffer is returned to
+// its pool. The frame's existing contents and the bytes produced are
+// identical to the unpooled fillbuf behaviour.
+func (d *Decoder) framebuf(v *Frame, l int) error {
+	if cap(v.buf) < l && d.pool != nil {
+		nb := d.pool.Get(l)
+		nb = nb[:len(v.buf)]
+		copy(nb, v.buf)
+		if v.pbuf != nil && v.pool != nil {
+			v.pool.Put(v.pbuf)
+		}
+		v.buf = nb
+		v.pool = d.pool
+		v.pbuf = nb[:cap(nb)]
+	}
+	var err error
+	v.buf, err = fillbuf(v.buf, d.src, l)
+	return err
+}
+
 // Decode reads the next complete discovered frame into the provided
 // Frame struct. A count of skipped bytes will be written to skipped.
+//
+// The frame's buffer is reused across calls, so decoding into the same
+// Frame in a loop performs no allocations in the steady state. Any
+// slices obtained from the Frame (Header, SideInfo, Reader) are
+// invalidated by the next Decode into that Frame, or by calling Release.
 func (d *Decoder) Decode(v *Frame, skipped *int) (err error) {
 	// Truncate the array
 	v.buf = v.buf[:0]
@@ -207,8 +269,7 @@ func (d *Decoder) Decode(v *Frame, skipped *int) (err error) {
 	// locate a sync frame
 	*skipped = 0
 	for {
-		v.buf, err = fillbuf(v.buf, d.src, hLen)
-		if err != nil {
+		if err = d.framebuf(v, hLen); err != nil {
 			return err
 		}
 		if v.buf[0] == 0xFF && (v.buf[1]&0xE0 == 0xE0) &&
@@ -232,8 +293,7 @@ func (d *Decoder) Decode(v *Frame, skipped *int) (err error) {
 	crcLen := 0
 	if v.Header().Protection() {
 		crcLen = 2
-		v.buf, err = fillbuf(v.buf, d.src, hLen+crcLen)
-		if err != nil {
+		if err = d.framebuf(v, hLen+crcLen); err != nil {
 			return err
 		}
 	}
@@ -243,18 +303,33 @@ func (d *Decoder) Decode(v *Frame, skipped *int) (err error) {
 		return err
 	}
 
-	v.buf, err = fillbuf(v.buf, d.src, hLen+crcLen+sideLen)
-	if err != nil {
+	if err = d.framebuf(v, hLen+crcLen+sideLen); err != nil {
 		return err
 	}
 
 	dataLen := v.Size()
-	v.buf, err = fillbuf(v.buf, d.src, dataLen)
-	if err != nil {
+	if err = d.framebuf(v, dataLen); err != nil {
 		return err
 	}
 
 	return nil
+}
+
+// Release returns the frame's buffer to the buffer pool of the decoder
+// that produced it, so it can be reused by capacity for later frames.
+// Callers decoding into a fresh Frame each iteration should call Release
+// once they are done with the frame; this keeps peak memory bounded by
+// the pool's limit instead of growing with the stream's duration.
+//
+// The Frame, and any slices previously obtained from it, must not be
+// used after Release is called. Release is idempotent.
+func (f *Frame) Release() {
+	if f.pbuf != nil && f.pool != nil {
+		f.pool.Put(f.pbuf)
+	}
+	f.pool = nil
+	f.pbuf = nil
+	f.buf = nil
 }
 
 // SideInfoLength retursn the expected side info length for this
